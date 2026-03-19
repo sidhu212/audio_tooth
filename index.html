@@ -316,6 +316,7 @@
             <div id="roomCode" class="room-code">------</div>
             <p style="font-size: 0.7rem; color: var(--text-muted); margin-top: 0.5rem;">Share this code with the
                 receiver</p>
+            <button id="copyCodeBtn" class="secondary" style="margin-top: 1rem;">Copy Room Code</button>
         </div>
 
         <div id="mainActions" class="actions">
@@ -338,6 +339,10 @@
             <button id="resumeBtn" class="accent">Tap to Resume Audio</button>
         </div>
 
+        <div id="retryContainer" class="hidden" style="margin-top: 1rem;">
+            <button id="retryBtn" class="secondary">Retry Connection</button>
+        </div>
+
         <div id="pwaMessage" class="ux-message" style="display: none;">
             <strong>Pro Tip (Native Feel)</strong>
             For best background audio reliability, tap 'Add to Home Screen' and install this app.
@@ -356,50 +361,42 @@
     </div>
 
     <script>
-        // --- Service Worker Registration ---
         if ('serviceWorker' in navigator) {
             window.addEventListener('load', () => {
                 navigator.serviceWorker.register('/sw.js')
-                    .then(reg => {
-                        console.log('SW Registered', reg.scope);
-                        // Check if effectively installed
-                        if (window.matchMedia('(display-mode: standalone)').matches) {
-                            console.log('Running as PWA');
-                        } else {
+                    .then(() => {
+                        if (!window.matchMedia('(display-mode: standalone)').matches) {
                             document.getElementById('pwaMessage').style.display = 'block';
                         }
                     })
-                    .catch(err => console.log('SW Registration failed', err));
+                    .catch(() => { });
             });
         }
 
-        // --- Configuration ---
-        const WS_URL = (window.location.protocol === 'https:' ? 'wss://' : 'ws://') +
-            (window.location.host || 'localhost:3000');
+        // Set this in deployment, e.g. "wss://audio-tooth-backend.onrender.com"
+        const BACKEND_WS_URL = window.BACKEND_WS_URL || 'wss://your-backend-domain.onrender.com';
+        const ICE_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+        const ROOM_ID_REGEX = /^\d{6}$/;
 
-        const ICE_CONFIG = {
-            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-        };
-
-        // --- State ---
         let socket = null;
         let peerConnection = null;
         let localStream = null;
         let roomId = null;
         let role = null;
         let iceCandidateQueue = [];
+        let shouldReconnect = false;
 
-        // --- Silent Loop (Background Keep-Alive) ---
         const silentAudio = new Audio();
         silentAudio.loop = true;
-        // 1-second silent WAV
         silentAudio.src = "data:audio/wav;base64,UklGRjIAAABXQVZFZm10IBAAAAABAAEAIlYAAIhYAQACABAAZGF0YRAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
-        // --- DOM Elements ---
         const startBtn = document.getElementById('startBtn');
         const joinBtn = document.getElementById('joinBtn');
         const leaveBtn = document.getElementById('leaveBtn');
         const resumeBtn = document.getElementById('resumeBtn');
+        const copyCodeBtn = document.getElementById('copyCodeBtn');
+        const retryBtn = document.getElementById('retryBtn');
+        const retryContainer = document.getElementById('retryContainer');
         const resumeContainer = document.getElementById('resumeContainer');
         const roomInput = document.getElementById('roomInput');
         const roomCodeDisplay = document.getElementById('roomCode');
@@ -411,27 +408,25 @@
         const codeInputGroup = document.getElementById('codeInputGroup');
         const bgTips = document.getElementById('bgTips');
 
-        // --- Visibility Management ---
-        document.addEventListener('visibilitychange', () => {
-            if (document.hidden) {
-                log('App in background', 'warning');
-            } else {
-                log('App in foreground', 'info');
-                // Recovery Mechanism
-                if (role === 'receiver' && remoteAudio.paused && remoteAudio.srcObject) {
-                    log('Attempting auto-resume...', 'info');
-                    attemptPlayback();
-                }
-            }
-        });
+        function setConnectionState(state) {
+            const states = {
+                standby: { label: 'Disconnected', color: 'var(--danger)' },
+                waiting: { label: 'Waiting for receiver', color: 'var(--warning)' },
+                connected: { label: 'Connected', color: 'var(--success)' },
+                streaming: { label: 'Streaming', color: 'var(--success)' }
+            };
+            const current = states[state] || states.standby;
+            statusText.innerText = current.label;
+            statusBadge.style.color = current.color;
+            if (state === 'streaming') statusBadge.classList.add('streaming-active');
+            else statusBadge.classList.remove('streaming-active');
+        }
 
-        function updateStatus(text, color = 'var(--warning)') {
-            if (statusText) statusText.innerText = text;
-            if (statusBadge) statusBadge.style.color = color;
+        function showRetry(show) {
+            retryContainer.classList.toggle('hidden', !show);
         }
 
         function log(message, type = 'default') {
-            if (!logsContainer) return;
             const entry = document.createElement('div');
             entry.className = `log-entry ${type}`;
             entry.innerText = `> ${message}`;
@@ -440,151 +435,148 @@
             console.log(`[AudioTooth] ${message}`);
         }
 
+        function showError(message) {
+            log(message, 'error');
+            setConnectionState('standby');
+            showRetry(true);
+        }
+
+        function sendSocketMessage(payload) {
+            if (!socket || socket.readyState !== WebSocket.OPEN) {
+                showError('Connection failed. Retry and try again.');
+                return;
+            }
+            socket.send(JSON.stringify(payload));
+        }
+
         function setupWebSocket() {
             return new Promise((resolve, reject) => {
-                log(`Connecting to: ${WS_URL}`, 'info');
-                socket = new WebSocket(WS_URL);
-                socket.onopen = () => { log('WebSocket Connected', 'success'); resolve(); };
-                socket.onerror = (err) => { log('WebSocket Connection Error', 'error'); reject(err); };
+                if (!BACKEND_WS_URL || BACKEND_WS_URL.includes('your-backend-domain')) {
+                    reject(new Error('Set BACKEND_WS_URL in index.html before deploy'));
+                    return;
+                }
+
+                log(`Connecting to: ${BACKEND_WS_URL}`, 'info');
+                socket = new WebSocket(BACKEND_WS_URL);
+
+                socket.onopen = () => {
+                    log('WebSocket connected', 'success');
+                    showRetry(false);
+                    resolve();
+                };
+                socket.onerror = () => reject(new Error('Connection failed'));
                 socket.onmessage = handleSocketMessage;
-                socket.onclose = () => { log('WebSocket Connection Closed', 'warning'); stopAll(); };
+                socket.onclose = () => {
+                    log('WebSocket closed', 'warning');
+                    cleanupPeerConnection();
+                    setConnectionState('standby');
+                    if (shouldReconnect) showRetry(true);
+                };
             });
         }
 
         async function handleSocketMessage(event) {
+            let data;
             try {
-                const data = JSON.parse(event.data);
-                log(`Event: ${data.type}`, 'info');
+                data = JSON.parse(event.data);
+            } catch (err) {
+                showError('Received invalid server message.');
+                return;
+            }
 
-                switch (data.type) {
-                    case 'room-created':
-                        roomId = data.roomId;
-                        roomCodeDisplay.innerText = roomId;
-                        roomDisplayArea.style.display = 'block';
-                        updateStatus('Awaiting Receiver', 'var(--warning)');
-                        break;
-                    case 'room-joined':
-                        roomId = data.roomId;
-                        updateStatus('Connected. Waiting for Signal...', 'var(--warning)');
-                        break;
-                    case 'receiver-joined':
-                        updateStatus('Receiver connected!', 'var(--success)');
-                        if (role === 'sender') startWebRTCFlow();
-                        break;
-                    case 'offer':
-                        if (role === 'receiver') await handleOffer(data.sdp);
-                        break;
-                    case 'answer':
-                        if (role === 'sender') {
-                            await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
-                            processIceQueue();
-                        }
-                        break;
-                    case 'ice-candidate':
-                        if (data.candidate) {
-                            const candidate = new RTCIceCandidate(data.candidate);
-                            if (peerConnection && peerConnection.remoteDescription) {
-                                await peerConnection.addIceCandidate(candidate).catch(e => log(`ICE Error: ${e.message}`, 'error'));
-                            } else {
-                                iceCandidateQueue.push(candidate);
-                            }
-                        }
-                        break;
-                    case 'error':
-                        log(`Server Error: ${data.message}`, 'error');
-                        alert(data.message);
-                        stopAll();
-                        break;
-                    case 'sender-disconnected':
-                    case 'receiver-disconnected':
-                        log('Peer disconnected', 'warning');
-                        if (role === 'receiver') {
-                            alert('Sender disconnected.');
-                            stopAll();
+            switch (data.type) {
+                case 'room-created':
+                    roomId = data.roomId;
+                    roomCodeDisplay.innerText = roomId;
+                    roomDisplayArea.style.display = 'block';
+                    setConnectionState('waiting');
+                    break;
+                case 'room-joined':
+                    roomId = data.roomId;
+                    setConnectionState('connected');
+                    break;
+                case 'receiver-joined':
+                    if (role === 'sender') {
+                        setConnectionState('connected');
+                        await startWebRTCFlow();
+                    }
+                    break;
+                case 'offer':
+                    if (role === 'receiver') await handleOffer(data.sdp);
+                    break;
+                case 'answer':
+                    if (role === 'sender' && peerConnection) {
+                        await peerConnection.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: data.sdp }));
+                        await processIceQueue();
+                    }
+                    break;
+                case 'ice-candidate':
+                    if (data.candidate) {
+                        const candidate = new RTCIceCandidate(data.candidate);
+                        if (peerConnection && peerConnection.remoteDescription) {
+                            await peerConnection.addIceCandidate(candidate).catch((e) => log(`ICE error: ${e.message}`, 'error'));
                         } else {
-                            cleanupPeerConnection();
-                            updateStatus('Receiver left. Ready...', 'var(--warning)');
+                            iceCandidateQueue.push(candidate);
                         }
-                        break;
-                }
-            } catch (e) {
-                log(`JSON Parse Error: ${e.message}`, 'error');
+                    }
+                    break;
+                case 'sender-disconnected':
+                case 'receiver-disconnected':
+                    log('Peer disconnected', 'warning');
+                    cleanupPeerConnection();
+                    setConnectionState('standby');
+                    showRetry(true);
+                    break;
+                case 'error':
+                    showError(data.message || 'Unknown server error');
+                    break;
+                default:
+                    break;
             }
         }
 
         function createPeerConnection() {
-            log('Initializing WebRTC...');
             const pc = new RTCPeerConnection(ICE_CONFIG);
-            pc.onicecandidate = (e) => {
-                if (e.candidate) {
-                    socket.send(JSON.stringify({ type: 'ice-candidate', roomId, candidate: e.candidate }));
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    sendSocketMessage({ type: 'ice-candidate', roomId, candidate: event.candidate });
                 }
             };
             pc.onconnectionstatechange = () => {
-                log(`PC State: ${pc.connectionState}`, 'info');
+                log(`WebRTC state: ${pc.connectionState}`, 'info');
                 if (pc.connectionState === 'connected') {
-                    updateStatus('Streaming LIVE', 'var(--success)');
-                    statusBadge.classList.add('streaming-active');
+                    setConnectionState('streaming');
+                    showRetry(false);
                     if (role === 'receiver') {
                         bgTips.classList.remove('hidden');
                         remoteAudio.style.display = 'block';
                     }
+                } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+                    showError('Connection failed. Tap retry.');
                 }
             };
-            pc.ontrack = (e) => {
-                log('Remote track received', 'success');
-                // Target the single audio element
-                remoteAudio.srcObject = e.streams[0];
-                setupMediaSession();
+            pc.ontrack = (event) => {
+                remoteAudio.srcObject = event.streams[0];
                 attemptPlayback();
             };
             return pc;
         }
 
-        function setupMediaSession() {
-            if ('mediaSession' in navigator) {
-                log('Configuring Media Session API...', 'info');
-                navigator.mediaSession.metadata = new MediaMetadata({
-                    title: "PC Audio Stream",
-                    artist: "Live Stream",
-                    album: "Audio Tooth",
-                    artwork: [
-                        { src: 'https://via.placeholder.com/512/6366f1/ffffff?text=Streaming', sizes: '512x512', type: 'image/png' }
-                    ]
-                });
-
-                navigator.mediaSession.setActionHandler('play', () => {
-                    log('MediaSession: Play');
-                    remoteAudio.play().catch(() => { });
-                });
-                navigator.mediaSession.setActionHandler('pause', () => {
-                    log('MediaSession: Pause');
-                    remoteAudio.pause();
-                });
-            }
-        }
-
         function attemptPlayback() {
-            // Priority: Start silent keep-alive loop
-            silentAudio.play().catch(e => log('Keep-alive loop blocked', 'warning'));
-
-            // Start main audio
+            silentAudio.play().catch(() => { });
             remoteAudio.play()
                 .then(() => {
-                    log('Audio playback started', 'success');
                     resumeContainer.style.display = 'none';
-                    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
                 })
-                .catch(err => {
-                    log('Playback blocked by browser', 'warning');
+                .catch(() => {
                     resumeContainer.style.display = 'block';
                 });
         }
 
-        function processIceQueue() {
-            while (iceCandidateQueue.length) {
+        async function processIceQueue() {
+            while (iceCandidateQueue.length && peerConnection) {
                 const candidate = iceCandidateQueue.shift();
-                peerConnection.addIceCandidate(candidate).catch(e => log(`ICE Error: ${e.message}`, 'error'));
+                await peerConnection.addIceCandidate(candidate).catch((e) => log(`ICE queue error: ${e.message}`, 'error'));
             }
         }
 
@@ -592,95 +584,126 @@
             if (peerConnection) peerConnection.close();
             peerConnection = null;
             iceCandidateQueue = [];
-            statusBadge.classList.remove('streaming-active');
+            remoteAudio.srcObject = null;
         }
 
         async function startStreaming() {
             role = 'sender';
+            shouldReconnect = true;
+            showRetry(false);
             try {
-                log('Opening screen picker...', 'info');
                 localStream = await navigator.mediaDevices.getDisplayMedia({
                     video: { displaySurface: 'monitor' },
                     audio: true,
                     systemAudio: 'include'
                 });
 
-                if (localStream.getAudioTracks().length === 0) {
-                    localStream.getTracks().forEach(t => t.stop());
-                    alert('Audio NOT detected! Ensure "Share system audio" is checked.');
+                if (!localStream.getAudioTracks().length) {
+                    localStream.getTracks().forEach((track) => track.stop());
+                    showError('No system audio selected. Re-share with audio enabled.');
                     return;
                 }
 
                 await setupWebSocket();
-                updateUIForActive('sender');
+                updateUIForActive();
                 roomDisplayArea.style.display = 'block';
                 roomCodeDisplay.innerText = '......';
-                socket.send(JSON.stringify({ type: 'create-room' }));
-
+                setConnectionState('waiting');
+                sendSocketMessage({ type: 'create-room' });
             } catch (err) {
-                log(err.message, 'error');
+                showError(err.message || 'Connection failed');
             }
         }
 
         async function startWebRTCFlow() {
             cleanupPeerConnection();
             peerConnection = createPeerConnection();
-            localStream.getTracks().forEach(t => peerConnection.addTrack(t, localStream));
+            localStream.getTracks().forEach((track) => peerConnection.addTrack(track, localStream));
             const offer = await peerConnection.createOffer();
             await peerConnection.setLocalDescription(offer);
-            socket.send(JSON.stringify({ type: 'offer', roomId, sdp: offer.sdp }));
+            sendSocketMessage({ type: 'offer', roomId, sdp: offer.sdp });
         }
 
         async function joinStream() {
             role = 'receiver';
+            shouldReconnect = true;
             const code = roomInput.value.trim();
-            if (code.length !== 6) return alert('Enter a 6-digit code');
-
-            log('Joining stream...', 'info');
-
-            // Interaction Requirement: Trigger play() here
-            attemptPlayback();
+            if (!ROOM_ID_REGEX.test(code)) {
+                showError('Invalid room. Enter a 6-digit room code.');
+                return;
+            }
 
             try {
+                attemptPlayback();
                 await setupWebSocket();
-                socket.send(JSON.stringify({ type: 'join-room', roomId: code }));
-                updateUIForActive('receiver');
-            } catch (err) { log(err.message, 'error'); }
+                roomId = code;
+                updateUIForActive();
+                setConnectionState('connected');
+                sendSocketMessage({ type: 'join-room', roomId: code });
+            } catch (err) {
+                showError('Connection failed. Please retry.');
+            }
         }
 
         async function handleOffer(sdp) {
             cleanupPeerConnection();
             peerConnection = createPeerConnection();
             await peerConnection.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp }));
-            processIceQueue();
+            await processIceQueue();
             const answer = await peerConnection.createAnswer();
             await peerConnection.setLocalDescription(answer);
-            socket.send(JSON.stringify({ type: 'answer', roomId, sdp: answer.sdp }));
+            sendSocketMessage({ type: 'answer', roomId, sdp: answer.sdp });
         }
 
-        function updateUIForActive(mode) {
+        async function copyRoomCode() {
+            if (!roomId) return;
+            try {
+                await navigator.clipboard.writeText(roomId);
+                log('Room code copied', 'success');
+            } catch (_) {
+                showError('Could not copy room code.');
+            }
+        }
+
+        function retryConnection() {
+            if (role === 'sender') startStreaming();
+            else if (role === 'receiver') joinStream();
+        }
+
+        function updateUIForActive() {
             startBtn.classList.add('hidden');
             joinBtn.classList.add('hidden');
             codeInputGroup.classList.add('hidden');
             leaveBtn.classList.remove('hidden');
-            updateStatus(mode === 'sender' ? 'Creating Room...' : 'Connecting...');
         }
 
         function stopAll() {
-            if (localStream) localStream.getTracks().forEach(t => t.stop());
+            shouldReconnect = false;
+            if (localStream) localStream.getTracks().forEach((track) => track.stop());
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                sendSocketMessage({ type: 'leave-room', roomId });
+            }
             if (socket) socket.close();
             cleanupPeerConnection();
+            setConnectionState('standby');
             location.reload();
         }
 
-        // Event Listeners
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden && role === 'receiver' && remoteAudio.paused && remoteAudio.srcObject) {
+                attemptPlayback();
+            }
+        });
+
         startBtn.onclick = startStreaming;
         joinBtn.onclick = joinStream;
         leaveBtn.onclick = stopAll;
         resumeBtn.onclick = attemptPlayback;
+        copyCodeBtn.onclick = copyRoomCode;
+        retryBtn.onclick = retryConnection;
+        roomInput.oninput = (event) => { event.target.value = event.target.value.replace(/[^0-9]/g, ''); };
 
-        roomInput.oninput = (e) => e.target.value = e.target.value.replace(/[^0-9]/g, '');
-
+        setConnectionState('standby');
     </script>
 </body>
 
